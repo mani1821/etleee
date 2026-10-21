@@ -1,0 +1,136 @@
+# =====================================================================================
+# ETL migration parity validation: what to compare, for every environment.
+#
+#   run_parity("<this file>", env="oracle")       real migration tables in the two Oracle databases
+#   run_parity("<this file>", env="databricks")   sample tables in it_bronze_dev.test_only
+#
+# Without env, default_env is used.
+# Filters and delta conditions run in the chosen environment's database: Oracle SQL for oracle,
+# Spark SQL for databricks. Write a condition once when it works in both
+# (e.g. UPDATE_TS >= TIMESTAMP '...'); otherwise give one per environment:
+#     filter: {oracle: "SALE_DT >= TRUNC(SYSDATE) - 30", databricks: "SALE_DT >= current_date() - 30"}
+# =====================================================================================
+
+default_env: oracle
+
+environments:
+  oracle:
+    source:                                    # existing ETL's output
+      type: oracle
+      url: jdbc:oracle:thin:@//source-db.corp:1521/DWHPRD
+      user: PARITY_RO
+      schema: DWH_SRC
+      password_secret: {scope: etl_parity, key: src_db_pwd}    # Databricks secret (or password_env: VAR)
+      # properties: {oracle.net.wallet_location: "..."}         # extra JDBC properties (wallet, TLS, ...)
+    target:                                    # new ETL's output
+      type: oracle
+      url: jdbc:oracle:thin:@//target-db.corp:1521/DWHMIG
+      user: PARITY_RO
+      schema: DWH_TGT
+      password_secret: {scope: etl_parity, key: tgt_db_pwd}
+
+  databricks:                                  # tables in Unity Catalog; {table} = table name in lower case
+    source:
+      type: table
+      name: "it_bronze_dev.test_only.{table}_src"
+    target:
+      type: table
+      name: "it_bronze_dev.test_only.{table}_tgt"
+
+# ---- settings (an environment can override any of them in its own settings: block)
+settings:
+  sample_threshold_rows: 500000      # tables with more rows than this are sampled ...
+  sample_pct: 10                     # ... 10% of the rows ...
+  max_sample_rows: 100000            # ... but at most 100,000 rows per side
+  sample_seed: 42                    # same seed = same sample on every run
+  read_partitions: 16                # parallel slices for full reads from Oracle
+  count_tolerance_pct: 0.0           # allowed row-count difference in %; also used by missing_keys / extra_keys
+                                     #   (% of the source / target keys compared); within = WARN
+  row_mismatch_tolerance_pct: 0.0    # % of matched rows allowed to differ in value (0 = all must match);
+                                     #   also used per column by column_diff:<COL> (within = WARN)
+  mismatch_sample_limit: 50          # example bad rows kept per table per problem
+  parallel_tables: 1                 # tables validated at the same time (1 = one by one); e.g. 4 on a big cluster
+  # ts_truncate: second             # every table: ignore timestamp differences below this unit (a table can override, "none" = off)
+  # run report + e-mail (optional; both work in any environment)
+  # report_path: /Workspace/Users/<you>/parity_reports   # writes parity_<run_id>.html there
+  # email:
+  #   to: "you@ftr.com, team@ftr.com"
+  #   send_on: always                 # always | issues (any WARN/FAIL/ERROR) | failure (FAIL/ERROR only) | never
+  #   smtp_server: mailrelay.ftr.com
+  #   smtp_port: 25
+  #   sender: noreply@ftr.databricks.com
+  #   starttls: true
+  #   subject_prefix: "[ETL parity]"
+  # incremental checks: differences within these tolerances are WARN instead of FAIL
+  # (a table's incremental: block can set count_tolerance_pct / key_tolerance_pct / value_tolerance_pct itself)
+  delta_count_tolerance_pct: 0.0     # delta row counts may differ by this % of the source delta
+  delta_key_tolerance_pct: 0.0       # missed + extra delta keys up to this % of the source delta keys
+  # delta_value_tolerance_pct: 0.0   # differing delta rows up to this % of matched rows (default: row_mismatch_tolerance_pct)
+  # column distributions of text / date / timestamp columns (counts per value, text length, day/month, hour of day)
+  distributions: true
+  distribution_max_categories: 1000  # text columns with more distinct values are compared by text length
+  distribution_tolerance_pct: 0.0    # a bucket's count may differ by this % ...
+  distribution_tolerance_rows: 0     # ... or by this many rows (within EITHER = WARN; tables can override both)
+  # tables WITHOUT keys, bigger than sample_threshold_rows:
+  keyless_method: fingerprint        # fingerprint = every row checked via bucket fingerprints | sample = v2 (10% of rows)
+  fingerprint_buckets: 0             # 0 = auto (~2,000 rows per bucket, 1,000 to 100,000 buckets)
+  max_detail_rows: 1000000           # rows of differing buckets compared row by row (per side)
+  results_table: it_bronze_dev.test_only.parity_results        # created on first run, appended after
+  mismatch_table: it_bronze_dev.test_only.parity_mismatches
+
+# ---- tables
+# ${NAME} placeholders are filled at run time: run_parity(..., params={"SRC_BATCH_ID": "101", ...})
+# Per table:
+#   name                        table name (source side)
+#   target_name                 table name on the target side, if different
+#   keys                        business key: how rows are matched across the two sides
+#                               (empty / left out = no grain: rows are matched by all compared columns)
+#   exclude_cols                columns never compared (surrogate keys, batch ids, load timestamps)
+#   filter                      same condition on both sides, e.g. "SALE_DT >= DATE '2026-09-01'"
+#   num_tolerance               numbers may differ by up to this much (absolute)
+#   ts_truncate                 second | minute | hour | day | millisecond: ignore smaller timestamp differences
+#                               (overrides settings.ts_truncate; "none" = off for this table)
+#   force_full                  true = never sample this table
+#   row_mismatch_tolerance_pct  overrides the setting above for this table
+#   incremental                 source_delta / target_delta: rows each ETL run wrote; delta_only: true = skip full checks;
+#                               count_tolerance_pct / key_tolerance_pct / value_tolerance_pct: per-table delta tolerances
+#   distribution_tolerance_pct / distribution_tolerance_rows   override the distribution tolerances for this table
+#   envs                        only validate this table in these environments
+
+tables:
+  - name: DIM_CUSTOMER
+    keys: [CUSTOMER_NBR, EFF_FROM_DT]
+    exclude_cols: [CUSTOMER_SK, ETL_BATCH_ID, INSERT_TS, UPDATE_TS]
+    incremental:
+      source_delta: "UPDATE_TS >= TIMESTAMP '${SRC_RUN_START}'"
+      target_delta: "UPDATE_TS >= TIMESTAMP '${TGT_RUN_START}'"
+
+  - name: FACT_SALES
+    keys: [ORDER_ID, ORDER_LINE_NBR]
+    exclude_cols: [SALES_SK, ETL_BATCH_ID, LOAD_TS]
+    filter:
+      oracle: "SALE_DT >= DATE '2026-01-01'"
+      databricks: null                           # sample data: compare everything
+    num_tolerance: 0.01                          # 10.00 vs 10.01 counts as equal
+    ts_truncate: second
+    incremental:
+      source_delta: "ETL_BATCH_ID = ${SRC_BATCH_ID}"
+      target_delta: "ETL_BATCH_ID = ${TGT_BATCH_ID}"
+      delta_only: false
+
+  - name: FACT_INVENTORY_SNAPSHOT
+    target_name: FACT_INV_SNAPSHOT
+    keys: [SNAPSHOT_DT, STORE_ID, SKU_ID]
+    exclude_cols: [ETL_BATCH_ID]
+
+  - name: DIM_PRODUCT                            # exists only in the sample data
+    envs: [databricks]
+    keys: [PRODUCT_CODE]
+
+  - name: FACT_EVENTS                            # no key at all (sample data): whole-row comparison
+    envs: [databricks]
+    keys: []
+    exclude_cols: [ETL_BATCH_ID]
+    incremental:
+      source_delta: "ETL_BATCH_ID = ${SRC_BATCH_ID}"
+      target_delta: "ETL_BATCH_ID = ${TGT_BATCH_ID}"
