@@ -1,0 +1,11 @@
+settings:
+  results_table: it_bronze_dev.test_only.parity_results
+  mismatch_table: it_bronze_dev.test_only.parity_mismatches
+  # ... your other settings ...
+  email:
+    to: "skk983@ftr.com, teammate1@ftr.com, teammate2@ftr.com"    # comma-separated
+    send_on: always                     # always | issues | failure | never
+    smtp_server: mailrelay.ftr.com
+    smtp_port: 25
+    sender: noreply@ftr.databricks.com
+    starttls: true
