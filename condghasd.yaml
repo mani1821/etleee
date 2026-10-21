@@ -9,3 +9,5 @@ settings:
     smtp_port: 25
     sender: noreply@ftr.databricks.com
     starttls: true
+settings:
+  report_path: /Workspace/Users/skk983@ftr.com/parity_reports
