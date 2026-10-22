@@ -19,23 +19,49 @@ SEP = "\u0001"
 # --------------------------------------------------------------------------- helpers
 _NTZ = getattr(T, "TimestampNTZType", None)          # Spark 3.4+
 
+def norm_col(c, dtype, ts_truncate: Optional[str] = None):
+    """One column without representation differences ('A ' = 'A', '' = NULL, NUMBER(10,2) = NUMBER, ts_truncate)."""
+    if isinstance(dtype, T.StringType):
+        return F.when(F.trim(c) == "", F.lit(None)).otherwise(F.trim(c))
+    if isinstance(dtype, T.DecimalType):
+        return c.cast(T.DecimalType(38, 10))
+    if isinstance(dtype, (T.DoubleType, T.FloatType)):
+        return F.round(c.cast("double"), 8)
+    if isinstance(dtype, T.TimestampType) and ts_truncate:
+        return F.date_trunc(ts_truncate, c)
+    if _NTZ and isinstance(dtype, _NTZ) and ts_truncate:                    # TIMESTAMP_NTZ: same, keep the type
+        return F.date_trunc(ts_truncate, c).cast(_NTZ())
+    return c
+
+
 def normalize(df: DataFrame, ts_truncate: Optional[str] = None) -> DataFrame:
     """Remove representation differences that are not data differences."""
-    out = []
-    for f in df.schema.fields:
-        c = F.col(f.name)
-        if isinstance(f.dataType, T.StringType):
-            c = F.when(F.trim(c) == "", F.lit(None)).otherwise(F.trim(c))        # 'A ' = 'A', '' = NULL
-        elif isinstance(f.dataType, T.DecimalType):
-            c = c.cast(T.DecimalType(38, 10))                                     # NUMBER(10,2) vs NUMBER
-        elif isinstance(f.dataType, (T.DoubleType, T.FloatType)):
-            c = F.round(c.cast("double"), 8)
-        elif isinstance(f.dataType, T.TimestampType) and ts_truncate:
-            c = F.date_trunc(ts_truncate, c)
-        elif _NTZ and isinstance(f.dataType, _NTZ) and ts_truncate:            # TIMESTAMP_NTZ: same, keep the type
-            c = F.date_trunc(ts_truncate, c).cast(_NTZ())
-        out.append(c.alias(f.name))
-    return df.select(*out)
+    return df.select(*[norm_col(F.col(f.name), f.dataType, ts_truncate).alias(f.name) for f in df.schema.fields])
+
+
+def key_canon(c, dtype, ts_truncate: Optional[str] = None):
+    """A key value as canonical text, equal on both sides whenever the comparison sees the values as equal:
+    5 (INT) = 5.00 (DECIMAL) = '5.0000000000', 'A ' = 'A', timestamps after ts_truncate."""
+    c = norm_col(c, dtype, ts_truncate)
+    if isinstance(dtype, (T.ByteType, T.ShortType, T.IntegerType, T.LongType, T.DecimalType)):
+        return c.cast(T.DecimalType(38, 10)).cast("string")
+    return c.cast("string")
+
+
+def key_bucket(df: DataFrame, keys: list, ts_truncate: Optional[str] = None, buckets: int = 1_000_000):
+    """Deterministic 0..buckets-1 per key (same key -> same bucket on both sides, whatever the column types)."""
+    types = {f.name: f.dataType for f in df.schema.fields}
+    canon = [F.coalesce(key_canon(F.col(k), types[k], ts_truncate), F.lit(NULL_TOKEN)) for k in keys]
+    return F.pmod(F.xxhash64(F.concat_ws(SEP, *canon)), F.lit(buckets))
+
+
+def with_norm_keys(df: DataFrame, keys: list, ts_truncate: Optional[str] = None) -> tuple:
+    """df plus normalised copies of the key columns (__nk0, __nk1, ...): joins on keys must match the way the
+    comparison does ('A ' = 'A', truncated timestamps, ...), or a key that differs only in representation looks
+    missing on the other side. Returns (df, names of the normalised key columns)."""
+    types = {f.name: f.dataType for f in df.schema.fields}
+    names = [f"__nk{i}" for i in range(len(keys))]
+    return df.select("*", *[norm_col(F.col(k), types[k], ts_truncate).alias(n) for k, n in zip(keys, names)]), names
 
 
 def row_hash(cols: list[str]):
@@ -393,4 +419,27 @@ def compare_distributions(src: DataFrame, tgt: DataFrame, cols: list[str], max_c
         out[r["column"]]["diff" if r["bad"] else "within"].append((r["kind"], r["bucket"], r["s"], r["t"]))
     mism = w.select(F.to_json(F.struct("column", "kind", "bucket")).alias("key"), F.col("column"),
                     F.col("s").cast("string").alias("src_value"), F.col("t").cast("string").alias("tgt_value"))
+    # failing buckets per column (for distribution_rows) and how each bucket is computed
+    for r in w.select("column", "kind", "bucket").limit(20_000).collect():
+        out[r["column"]].setdefault("bad_buckets", []).append((r["kind"], r["bucket"]))
+    out["__specs__"] = specs
     return out, mism
+
+
+def distribution_rows(src: DataFrame, tgt: DataFrame, cols: list[str], column: str, specs: list, buckets: list):
+    """
+    Tables without keys: the whole rows behind the failing buckets of ONE column - rows in a failing bucket that
+    have no identical row on the other side (counting copies). Returns (source_only_df, target_only_df), each with
+    key = the whole row as JSON, column, src_value = the bucket ("values N", "day 2026-10-01", ...), tgt_value = side.
+    """
+    exprs = {(c, k): e for c, k, e in specs if c == column}
+    by_kind: dict = {}
+    for k, b in buckets:
+        by_kind.setdefault(k, []).append(b)
+    label = F.coalesce(*[F.when(exprs[(column, k)].cast("string").isin(bs), F.concat(F.lit(k + " "), exprs[(column, k)].cast("string")))
+                         for k, bs in by_kind.items() if (column, k) in exprs])
+    s_in, t_in = src.select(*cols).where(label.isNotNull()), tgt.select(*cols).where(label.isNotNull())
+    row_json = F.to_json(F.struct(*[F.col(c) for c in cols])).alias("key")
+    shape = lambda df, side: df.select(row_json, F.lit(column).alias("column"), label.alias("src_value"),
+                                       F.lit(side).alias("tgt_value"))
+    return shape(s_in.exceptAll(t_in), "only in source"), shape(t_in.exceptAll(s_in), "only in target")
