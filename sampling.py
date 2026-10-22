@@ -2,7 +2,9 @@
 Which rows get compared.
 
     small table (<= sample_threshold_rows) or force_full  -> every row, both sides
-    big table                                              -> sample-and-lookup, both directions:
+    big table, Databricks tables                           -> key-hash sample: the same keys on both sides
+                                                              (hash of the normalised key < sample fraction)
+    big table, Oracle                                      -> sample-and-lookup, both directions:
 
         1. sample the SOURCE (sample_pct %, at most max_sample_rows)   -> rows A
         2. fetch the same keys from the TARGET                          -> rows B
@@ -47,12 +49,35 @@ def rows_to_compare(src_reader, tgt_reader, spec: TableSpec, cols: list[str], s:
                             tgt_reader.read(spec.target_name, cols, tgt_where, n_tgt),
                             "delta" if delta else "full")
 
+    from .readers import TableReader
+    if isinstance(src_reader, TableReader) and isinstance(tgt_reader, TableReader):
+        # Databricks tables: the SAME keys on both sides, picked by a hash of the (normalised) key. Deterministic
+        # (no random sample that could change between two reads, no cache needed), and no lookups: a key in the
+        # sample of one side but not of the other is missing / extra on its own.
+        from .checks import key_bucket
+        f = min(s.sample_pct / 100.0, s.max_sample_rows / max(n_src, n_tgt, 1))
+        cut = max(1, int(round(f * 1_000_000)))
+        a = src_reader.read(spec.name, cols, src_where, n_src)
+        b = tgt_reader.read(spec.target_name, cols, tgt_where, n_tgt)
+        a = a.where(key_bucket(a, keys, spec.ts_truncate) < cut)
+        b = b.where(key_bucket(b, keys, spec.ts_truncate) < cut)
+        note = (f"key-hash sample: the same {cut / 10_000:g}% of keys on both sides (deterministic) "
+                f"of {n_src:,} / {n_tgt:,} rows")
+        return ComparedRows(a, b, "delta_sample" if delta else "sample", [note])
+
     f_src, f_tgt = sample_fraction(n_src, s), sample_fraction(n_tgt, s)
-    a = cache(src_reader.sample(spec.name, cols, src_where, n_src, f_src, s.sample_seed))
-    b, note_b = tgt_reader.lookup(spec.target_name, cols, tgt_where, keys, a, n_tgt)
-    c = cache(tgt_reader.sample(spec.target_name, cols, tgt_where, n_tgt, f_tgt, s.sample_seed + 1))  # own seed: independent of A
-    c_new = c.join(a.select(*keys).distinct(), keys, "left_anti")      # target keys not already sampled
-    d, note_d = src_reader.lookup(spec.name, cols, src_where, keys, c_new, n_src)
+    ts = spec.ts_truncate
+    # key-hash sampling: the same rows on every recomputation (see TableReader.sample)
+    a = cache(src_reader.sample(spec.name, cols, src_where, n_src, f_src, s.sample_seed, keys=keys, ts_truncate=ts))
+    b, note_b = tgt_reader.lookup(spec.target_name, cols, tgt_where, keys, a, n_tgt, ts_truncate=ts)
+    c = cache(tgt_reader.sample(spec.target_name, cols, tgt_where, n_tgt, f_tgt, s.sample_seed + 1,  # own seed:
+                                keys=keys, ts_truncate=ts))                                          # independent of A
+    # target keys not already sampled - compared normalised, like the lookups and the row comparison
+    from .checks import with_norm_keys
+    cn, nk = with_norm_keys(c, keys, ts)
+    an, _ = with_norm_keys(a.select(*keys), keys, ts)
+    c_new = cn.join(an.select(*nk).distinct(), nk, "left_anti").select(*c.columns)
+    d, note_d = src_reader.lookup(spec.name, cols, src_where, keys, c_new, n_src, ts_truncate=ts)
     notes = [f"source sample {f_src:.4%} of {n_src:,} rows, target lookup: {note_b}",
              f"target sample {f_tgt:.4%} of {n_tgt:,} rows, source lookup: {note_d}"]
     return ComparedRows(a.unionByName(d), b.unionByName(c_new),
