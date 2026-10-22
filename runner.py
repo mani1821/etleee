@@ -23,7 +23,7 @@ from typing import Optional
 from pyspark.sql import DataFrame, SparkSession
 from pyspark.sql import functions as F
 
-from .checks import (RowSetResult, compare_distributions, compare_profiles, compare_rows, compare_rowsets, compare_schema, key_json,
+from .checks import (RowSetResult, compare_distributions, distribution_rows, compare_profiles, compare_rows, compare_rowsets, compare_schema, key_json,
                      normalize, try_cache, try_unpersist)
 from .config import Settings, TableSpec, build_spec, load_config
 from .readers import make_reader
@@ -238,8 +238,10 @@ class TableValidator:
         return ok
 
     # ------------------------------------------------------------------ 4b. column distributions
-    def _record_distributions(self, spec: TableSpec, scope, src, tgt, cols):
-        """distribution:<COL> per text / date / timestamp column: row counts per value / length / day / month / hour."""
+    def _record_distributions(self, spec: TableSpec, scope, src, tgt, cols, rows_from: Optional[tuple] = None):
+        """distribution:<COL> per text / date / timestamp column: row counts per value / length / day / month / hour.
+        rows_from (tables without keys): (source rows, target rows) to take example whole rows from for every failing
+        column - kind distribution_rows in the mismatch table."""
         if not self.s.distributions:
             return
         t, V = spec.name, "column_distributions"
@@ -251,6 +253,7 @@ class TableValidator:
         limit = f"{tol}% or {rows_tol:,} rows" if rows_tol else f"{tol}%"
         if not res:
             return
+        specs = res.pop("__specs__", [])
         bad = {}
         for c, d in res.items():
             kinds = ", ".join(f"{k} ({n:,} buckets)" for k, n in d["kinds"].items())
@@ -267,6 +270,19 @@ class TableValidator:
                 self.rec.rec(t, V, f"distribution:{c}", "PASS", detail=f"identical by {kinds}", scope=scope)
         if bad:
             self.rec.mismatches(t, V, "distribution", mism)
+        if bad and rows_from is not None:            # no keys: the whole rows behind each failing column
+            rs, rt = rows_from
+            for c in bad:
+                buckets = res[c].get("bad_buckets") or []
+                if not buckets:
+                    continue
+                try:
+                    s_only, t_only = distribution_rows(rs, rt, cols, c, specs, buckets)
+                    self.rec.mismatches(t, V, "distribution_rows", s_only)
+                    self.rec.mismatches(t, V, "distribution_rows", t_only)
+                except Exception as e:               # examples only: never fail the table for them
+                    self.rec.rec(t, V, f"distribution_rows:{c}", "INFO", detail=f"example rows not collected: "
+                                 f"{type(e).__name__}: {str(e).splitlines()[0][:200]}", scope=scope)
         self.rec.note(t, V, "; ".join(f"{c} {k} {b}: {s_:,} vs {t_:,}" for c, (k, b, s_, t_) in list(bad.items())[:4])
                       + (f"; +{len(bad) - 4} more columns" if len(bad) > 4 else ""))
 
@@ -304,8 +320,10 @@ class TableValidator:
         self._delta_count(t, V, spec, n_s, n_t, sw, tw)
 
         # delta keys: every key each run touched (key columns only)
-        ks = self.src.read(spec.name, keys, sw, n_s).dropna().distinct()
-        kt = self.tgt.read(spec.target_name, keys, tw, n_t).dropna().distinct()
+        # keys normalised like the row comparison ('A ' = 'A', ts_truncate), or representation-only differences
+        # would show as missed / extra keys
+        ks = normalize(self.src.read(spec.name, keys, sw, n_s), spec.ts_truncate).dropna().distinct()
+        kt = normalize(self.tgt.read(spec.target_name, keys, tw, n_t), spec.ts_truncate).dropna().distinct()
         missed, extra = ks.join(kt, keys, "left_anti"), kt.join(ks, keys, "left_anti")
         n_missed, n_extra = missed.count(), extra.count()
         ktol = self._delta_tol(spec, "key_tolerance_pct")
@@ -371,6 +389,7 @@ class TableValidator:
         else:
             da, db = try_cache(da), try_cache(db)
             r = compare_rowsets(da, db, cols)
+            fp["detail_src"], fp["detail_tgt"] = da, db      # rows of the differing buckets (distribution rows)
         mode = (f"no keys: whole-table fingerprints of every row in {fp['buckets']:,} buckets: "
                 f"{fp['used'] - fp['differing']:,} identical, {fp['differing']:,} differ; row detail from "
                 f"{fp['detailed']:,} bucket(s), {fp['detail_rows']:,} rows" + ("" if fp["complete"] else
@@ -431,7 +450,9 @@ class TableValidator:
             self.rec.note(t, "column_profiles", "; ".join(f"{c} {d[0]}" + (" ..." if len(d) > 1 else "")
                                                           for c, d in list(bad_cols.items())[:4])
                           + (f"; +{len(bad_cols) - 4} more columns" if len(bad_cols) > 4 else ""))
-            self._record_distributions(spec, scope, src_df, tgt_df, cols)
+            rows_from = (fp["detail_src"], fp["detail_tgt"]) if fp and fp.get("detail_src") is not None else \
+                (src_df, tgt_df)
+            self._record_distributions(spec, scope, src_df, tgt_df, cols, rows_from=rows_from)
         finally:
             try_unpersist(src_df, tgt_df)
 
