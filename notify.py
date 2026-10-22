@@ -32,7 +32,7 @@ from typing import Optional
 SEVERITY = {"PASS": 0, "INFO": 0, "SKIP": 1, "WARN": 2, "FAIL": 3, "ERROR": 4}
 COLORS = {"PASS": "#1a7f37", "WARN": "#9a6700", "FAIL": "#cf222e", "ERROR": "#8250df", "SKIP": "#57606a", "-": "#8c959f"}
 BG = {"PASS": "#dafbe1", "WARN": "#fff8c5", "FAIL": "#ffebe9", "ERROR": "#fbefff", "SKIP": "#f6f8fa", "-": "#f6f8fa"}
-EMAIL_KEYS = {"to", "send_on", "smtp_server", "smtp_port", "sender", "starttls", "subject_prefix"}
+EMAIL_KEYS = {"to", "send_on", "smtp_server", "smtp_port", "sender", "starttls", "subject_prefix", "report_link", "subject"}
 VALIDATIONS = [("schema", "Schema"), ("row_count", "Row count"), ("row_hash", "Row hash"),
                ("column_profiles", "Column profiles"), ("column_distributions", "Distributions"),
                ("incremental", "Incremental")]
@@ -173,7 +173,10 @@ def _checks_txt(c: Optional[dict]) -> str:
     return f"{c['checks']} check{'s' if c['checks'] != 1 else ''}: " + ", ".join(parts)
 
 
-def subject(rep: dict, prefix: str = "[ETL parity]") -> str:
+def subject(rep: dict, prefix: str = "[ETL parity]", fixed: Optional[str] = None) -> str:
+    """settings.email.subject = a fixed subject (e.g. ICD_DPI_Validation_Report_Notification); else a generated one."""
+    if fixed:
+        return fixed
     c, n = rep["counts"], len(rep["tables"])
     what = f"{c['PASS']} of {n} tables passed" + (f", {c['FAIL']} failed" if c["FAIL"] else "") + \
            (f", {c['ERROR']} errors" if c["ERROR"] else "")
@@ -182,10 +185,13 @@ def subject(rep: dict, prefix: str = "[ETL parity]") -> str:
 
 
 # ------------------------------------------------------------------ plain text
-def to_text(rep: dict) -> str:
+def to_text(rep: dict, email: bool = False, link: Optional[str] = None, title: Optional[str] = None) -> str:
+    """email=True: short version (summary + status per table and validation + link), no counts, no details."""
     c, n = rep["counts"], len(rep["tables"])
-    lines = [f"ETL parity run {r['label']} ({r['run_id']})  |  env {r['env']}  |  {r['run_ts']}  |  {r['duration']}"
-             for r in rep["runs"]] + ["",
+    lines = [title or "ETL parity report"] + ([] if email else [f"Overall result: {rep['overall']}"]) + [""] + \
+            ([f"Run ID: {', '.join(r['run_id'] for r in rep['runs'])}"] if email else
+             [f"ETL parity run {r['label']} ({r['run_id']})  |  env {r['env']}  |  {r['run_ts']}  |  {r['duration']}"
+              for r in rep["runs"]]) + ["",
              "RUN SUMMARY",
              f"  Total tables: {n}" + (f" (across {len(rep['runs'])} runs)" if rep["multi"] else ""),
              f"  Tables passed (every validation passed): {c['PASS']} of {n}"
@@ -195,8 +201,16 @@ def to_text(rep: dict) -> str:
                      + (f" ({v['within']} within tolerance)" if v["within"] else "")
                      + (f", {v['failed']} failed" if v["failed"] else "")
                      + (f"   [not run for {v['not_run']}]" if v["not_run"] else ""))
-    lines += ["", "SUMMARY TABLE (checks per table per validation)"]
+    lines += ["", "SUMMARY TABLE" + ("" if email else " (checks per table per validation)")]
     w = max([len(_tname(rep, t)) for t in rep["tables"]] + [5])
+    if email:
+        lines.append(f"{'table':<{w}}  {'result':<6}  " + "  ".join(f"{label:<15}" for _, label in VALIDATIONS))
+        for t in rep["tables"]:
+            lines.append(f"{_tname(rep, t):<{w}}  {t['status']:<6}  " + "  ".join(
+                f"{(t['cells'][k]['status'] if k in t['cells'] else 'not run'):<15}" for k, _ in VALIDATIONS))
+        lines += ["", f"Full details (checks, row counts, failures): {link}" if link else
+                  f"Full details: {rep['results_table']}  WHERE {rep['run_filter']}"]
+        return "\n".join(lines)
     for t in rep["tables"]:
         rows, comp = _rows_txt(t)
         lines.append(f"{_tname(rep, t).ljust(w)}  {t['status']:<5}  rows {rows} | compared {comp}")
@@ -224,14 +238,17 @@ def _badge(status: str, text: Optional[str] = None) -> str:
             f'color:{COLORS.get(status, "#57606a")};background:{BG.get(status, "#f6f8fa")}">{text or status}</span>')
 
 
-def to_html(rep: dict) -> str:
+def to_html(rep: dict, email: bool = False, link: Optional[str] = None, title: Optional[str] = None) -> str:
+    """email=False: full report (notebook output, report file). email=True: short e-mail version - run summary,
+    PASS / FAIL per table and validation, and a link to the job run that shows the full report."""
     e = html.escape
     c, n = rep["counts"], len(rep["tables"])
     font = "font-family:Segoe UI,Arial,Helvetica,sans-serif;"
     cell = "padding:6px 10px;border:1px solid #c8ccd1;vertical-align:top;font-size:13px;"
     head = "padding:6px 10px;border:1px solid #c8ccd1;background:#f3f4f6;text-align:left;font-size:12px;"
     h2 = "font-size:16px;font-weight:700;margin:22px 0 8px"
-    runs_html = "".join(
+    runs_html = (f'<div style="color:#57606a;font-size:13px;margin:2px 0">Run ID: '
+                 f'<b>{e(", ".join(r["run_id"] for r in rep["runs"]))}</b></div>') if email else "".join(
         f'<div style="color:#57606a;font-size:13px;margin:2px 0">{"run <b>" + e(r["label"]) + "</b> &middot; " if rep["multi"] else ""}'
         f'run id <b>{e(r["run_id"])}</b> &middot; env <b>{e(r["env"])}</b> &middot; {e(r["run_ts"])} &middot; '
         f'{e(r["duration"])} &middot; {e(r["config"])}</div>' for r in rep["runs"])
@@ -262,6 +279,9 @@ def to_html(rep: dict) -> str:
             if not cl:
                 tds.append(f'<td style="{cell}">not run</td>')
                 continue
+            if email:                            # e-mail: the verdict only
+                tds.append(f'<td style="{cell}"><b>{cl["status"]}</b></td>')
+                continue
             parts = [f'{cl["pass"]} pass'] + [f'{cl[k]} {name}' for k, name in
                                                (("warn", "within tol."), ("fail", "fail"), ("error", "error"),
                                                 ("skip", "skipped")) if cl[k]]
@@ -270,13 +290,17 @@ def to_html(rep: dict) -> str:
             tds.append(f'<td style="{cell}min-width:120px"><b>{cl["status"]}</b>{scope}<br>'
                        f'<span style="font-size:12px">{n_ch}: {e(", ".join(parts))}</span></td>')
         run_td = f'<td style="{cell}">{e(t["run"])}</td>' if rep["multi"] else ""
+        if email:
+            rows.append(f'<tr>{run_td}<td style="{cell}"><b>{e(t["table"])}</b></td>'
+                        f'<td style="{cell}"><b>{t["status"]}</b></td>{"".join(tds)}</tr>')
+            continue
         rows.append(f'<tr>{run_td}<td style="{cell}"><b>{e(t["table"])}</b><br><span style="font-size:11px;color:#57606a">'
                     f'rows {e(r)}<br>compared {e(comp)}</span></td><td style="{cell}"><b>{t["status"]}</b></td>'
                     f'{"".join(tds)}</tr>')
 
-    # 3. details: checks that did not pass
+    # 3. details: checks that did not pass (not in the e-mail: the link leads to them)
     details = []
-    for t in rep["tables"]:
+    for t in ([] if email else rep["tables"]):
         if not t["issues"]:
             continue
         items = []
@@ -290,32 +314,40 @@ def to_html(rep: dict) -> str:
         details.append(f'<div style="margin:12px 0;padding:10px 14px;border:1px solid #c8ccd1">'
                        f'<div style="font-size:15px;font-weight:700">{e(_tname(rep, t))} - {t["status"]}</div>'
                        f'{"".join(items)}</div>')
+    if email:
+        footer = (f'<div style="margin-top:18px;font-size:14px">Full details (checks, row counts, failures): '
+                  f'<a href="{e(link)}" style="color:#0969da;font-weight:600">open the job run</a></div>'
+                  if link else
+                  f'<div style="margin-top:18px;font-size:13px">Full details: <code>{e(rep["results_table"])}</code> '
+                  f'WHERE {e(rep["run_filter"])}</div>')
     sql = (f"SELECT table_name, validation, check_name, status, src_value, tgt_value, detail\n"
            f"FROM {rep['results_table']}\nWHERE {rep['run_filter']} AND status NOT IN ('PASS','INFO')\n"
            f"ORDER BY table_name, validation;")
-    return f"""<!doctype html><html><head><meta charset="utf-8"><title>ETL parity {e(rep['runs'][0]['run_id'] if rep['runs'] else '')}</title></head>
+    if not email:
+        footer = (f'<div style="margin-top:20px;font-size:12px;color:#57606a">All checks: <code>{e(rep["results_table"])}</code>, '
+                  f'example bad rows: <code>{e(rep["mismatch_table"])}</code></div>'
+                  f'<pre style="background:#f6f8fa;padding:10px;font-size:12px;overflow:auto">{e(sql)}</pre>')
+    return f"""<!doctype html><html><head><meta charset="utf-8"><title>{e(title or "ETL parity report")}</title></head>
 <body style="margin:0;padding:20px;background:#ffffff;color:#1f2328;{font}">
 <div style="max-width:1200px">
-  <div style="font-size:20px;font-weight:700">ETL parity report - {rep['overall']}</div>
+  <div style="font-size:20px;font-weight:700">{e(title or "ETL parity report")}</div>
+  {'' if email else f'<div style="font-size:14px;margin:4px 0 6px">Overall result: <b>{rep["overall"]}</b></div>'}
   {runs_html}
 
   <div style="{h2}">1. Run summary</div>
   <table cellspacing="0" cellpadding="0" style="border-collapse:collapse;min-width:560px">{''.join(summary)}</table>
-  <div style="font-size:11px;color:#57606a;margin-top:4px">A validation passes when none of its checks fails; checks
-    within tolerance count as passed. A table passes when all its validations pass.</div>
+  {'' if email else '<div style="font-size:11px;color:#57606a;margin-top:4px">A validation passes when none of its checks fails; checks within tolerance count as passed. A table passes when all its validations pass.</div>'}
 
-  <div style="{h2}">2. Summary table (checks per table per validation)</div>
+  <div style="{h2}">2. Summary table{'' if email else ' (checks per table per validation)'}</div>
   <table cellspacing="0" cellpadding="0" style="border-collapse:collapse;width:100%">
-    <tr>{f'<th style="{head}">Run</th>' if rep["multi"] else ''}<th style="{head}">Table (rows src vs tgt)</th>
+    <tr>{f'<th style="{head}">Run</th>' if rep["multi"] else ''}<th style="{head}">{'Table' if email else 'Table (rows src vs tgt)'}</th>
         <th style="{head}">Result</th>{cols}</tr>
     {''.join(rows)}
   </table>
 
   {f'<div style="{h2}">3. Details (checks that did not pass)</div>' if details else ''}
   {''.join(details)}
-  <div style="margin-top:20px;font-size:12px;color:#57606a">All checks: <code>{e(rep['results_table'])}</code>,
-    example bad rows: <code>{e(rep['mismatch_table'])}</code></div>
-  <pre style="background:#f6f8fa;padding:10px;font-size:12px;overflow:auto">{e(sql)}</pre>
+  {footer}
 </div></body></html>"""
 
 
@@ -325,6 +357,54 @@ def _tname(rep: dict, t: dict) -> str:
 
 def _verdict_word(v: dict) -> str:
     return "FAIL" if v["status"] in ("FAIL", "ERROR") else "PASS, within tolerance"
+
+
+# ------------------------------------------------------------------ link to the job run (Databricks)
+def job_run_link(spark=None) -> Optional[str]:
+    """
+    URL of the Databricks page that shows this notebook's output:
+      in a workflow  : https://<workspace>/jobs/<job_id>/runs/<task run id>  (this task's run: its notebook output)
+      run by hand    : https://<workspace>/?o=<org>#notebook/<notebook id>     (the notebook; output not kept)
+    None outside Databricks or when the context cannot be read.
+    """
+    try:
+        import json as _json
+        from pyspark.dbutils import DBUtils
+        from pyspark.sql import SparkSession
+        spark = spark or SparkSession.getActiveSession()
+        nb = DBUtils(spark).notebook.entry_point.getDbutils().notebook().getContext()
+        info: dict = {}
+        for how in ("toJson", "safeToJson"):     # the layout differs between runtimes: merge every level
+            try:
+                ctx = _json.loads(getattr(nb, how)())
+            except Exception:
+                continue
+            for part in (ctx, ctx.get("extraContext", {}), ctx.get("attributes", {}),
+                         ctx.get("tags", {}), ctx.get("attributes", {}).get("tags", {})):
+                if isinstance(part, dict):
+                    info.update({k: v for k, v in part.items() if not isinstance(v, dict)})
+        host = None
+        try:
+            host = spark.conf.get("spark.databricks.workspaceUrl")
+        except Exception:
+            pass
+        host = (host or info.get("browserHostName") or str(info.get("api_url") or info.get("apiUrl") or "")
+                .replace("https://", "")).strip().rstrip("/")
+        if not host:
+            return None
+        org = info.get("orgId")
+        q = f"?o={org}" if org else ""
+        job = info.get("jobId")
+        # the run of THIS task (its page shows this notebook's output); the whole job run only as a fallback
+        task_run = info.get("runId") or info.get("taskRunId")
+        job_run = info.get("multitaskParentRunId") or info.get("jobRunId")
+        run = task_run or job_run
+        if job and run:
+            return f"https://{host}/jobs/{job}/runs/{run}{q}"
+        nid = info.get("notebookId") or info.get("notebook_id")
+        return f"https://{host}/{q}#notebook/{nid}" if nid else f"https://{host}/{q}"
+    except Exception:
+        return None
 
 
 # ------------------------------------------------------------------ output
