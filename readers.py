@@ -80,13 +80,31 @@ class TableReader:
     def read(self, table, cols, where, n_rows=None) -> DataFrame:
         return self._base(table, where).select(*cols)
 
-    def sample(self, table, cols, where, n_rows, fraction, seed) -> DataFrame:
-        return self._base(table, where).sample(False, fraction, seed).select(*cols)
+    def sample(self, table, cols, where, n_rows, fraction, seed, keys=None, ts_truncate=None) -> DataFrame:
+        """
+        fraction of the rows. With keys: chosen by a hash of the (normalised) key, so the SAME rows come back every
+        time the sample is computed - df.sample() can return other rows when Spark recomputes it (no cache on
+        serverless, cache evicted under memory pressure, e.g. with parallel tables), and then sampled keys that were
+        never looked up on the other side would show as missing / extra.
+        """
+        base = self._base(table, where)
+        if not keys:
+            return base.sample(False, fraction, seed).select(*cols)
+        from .checks import with_norm_keys
+        b, nk = with_norm_keys(base, keys, ts_truncate)
+        scale = 1_000_000
+        pick = F.pmod(F.xxhash64(F.lit(int(seed)), *[F.col(c) for c in nk]), F.lit(scale)) < F.lit(int(round(fraction * scale)))
+        return b.where(pick).select(*cols)
 
-    def lookup(self, table, cols, where, keys, keys_df, n_rows=None):
-        wanted = keys_df.select(*keys).dropna().distinct()
-        rows = self._base(table, where).join(F.broadcast(wanted), keys, "left_semi").select(*cols)
-        return rows, "key join"
+    def lookup(self, table, cols, where, keys, keys_df, n_rows=None, ts_truncate=None):
+        """Rows of `table` whose key matches a key of keys_df, compared NORMALISED (trimmed text, ts_truncate, ...),
+        exactly as the row comparison does - a raw join would miss 'A ' vs 'A' and report the row as missing."""
+        from .checks import with_norm_keys
+        wanted, nk = with_norm_keys(keys_df.select(*keys), keys, ts_truncate)
+        wanted = wanted.select(*nk).dropna().distinct()
+        base, nk2 = with_norm_keys(self._base(table, where), keys, ts_truncate)
+        rows = base.join(F.broadcast(wanted), nk2, "left_semi").select(*cols)
+        return rows, "key join (normalised keys)"
 
     def describe_lookup(self, table, keys) -> str:
         return "key join"
@@ -190,7 +208,7 @@ class OracleReader:
                             for s in self._rowid_slices(table, n_rows)])
 
     # ---- sampling: Oracle reads only the sampled blocks
-    def sample(self, table, cols, where, n_rows, fraction, seed) -> DataFrame:
+    def sample(self, table, cols, where, n_rows, fraction, seed, keys=None, ts_truncate=None) -> DataFrame:
         pct = fraction * 100
         if pct >= 99.999999:
             return self.read(table, cols, where, n_rows)
@@ -225,7 +243,7 @@ class OracleReader:
         col = keys[0] if len(keys) == 1 else "(" + ", ".join(keys) + ")"
         return [f"{col} IN ({', '.join(lits[i:i + IN_LIST_MAX])})" for i in range(0, len(lits), IN_LIST_MAX)]
 
-    def lookup(self, table, cols, where, keys, keys_df, n_rows=None):
+    def lookup(self, table, cols, where, keys, keys_df, n_rows=None, ts_truncate=None):
         rows = keys_df.select(*keys).dropna().distinct().collect()
         sel, src = ", ".join(cols), self.fq(table)
         if not rows:
