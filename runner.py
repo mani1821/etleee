@@ -13,6 +13,7 @@ The flow for each table — read this file first to understand the framework.
 from __future__ import annotations
 
 import argparse
+import datetime
 import os
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -37,7 +38,8 @@ class ParityRun:
     summary_nested: DataFrame   # one row per table; validations and failed checks nested inside
     results: DataFrame      # one row per check
     failed: bool            # any FAIL or ERROR
-    report_html: str = ""   # the run report (displayHTML(run.report_html) in a notebook)
+    report_html: str = ""   # the full run report (displayHTML(run.report_html) in a notebook)
+    email_html: str = ""    # the short e-mail version (summary, PASS / FAIL table, link to the job run)
     report_text: str = ""
     report_file: Optional[str] = None   # where the HTML report was written (settings.report_path)
     email_sent: bool = False
@@ -540,13 +542,17 @@ def _report(run: ParityRun, rec, s, email_to: Optional[str], report_path: Option
     """HTML / text report on the ParityRun; optionally written to a file and e-mailed. Never fails the run."""
     from . import notify
     rep = notify.build_report([rec])
-    run.report_html, run.report_text = notify.to_html(rep), notify.to_text(rep)
-    run.report_file, run.email_sent, run.email_error = _deliver(
+    title = (s.email or {}).get("subject")
+    run.report_html, run.report_text = notify.to_html(rep, title=title), notify.to_text(rep, title=title)
+    run.report_file, run.email_sent, run.email_error, run.email_html = _deliver(
         rep, run.report_html, run.report_text, report_path or s.report_path, s.email if send else None, email_to)
 
 
 def _deliver(rep, html_text, text, folder, email_cfg, email_to):
-    """Write the report file and / or e-mail it. Returns (file, sent, error); never raises."""
+    """
+    Write the full report file and / or e-mail the short version (summary + PASS / FAIL table + link to the job run
+    whose notebook output shows the full report). Returns (file, sent, error, email_html); never raises.
+    """
     from . import notify
     path, sent, err = None, False, None
     if folder:
@@ -559,15 +565,20 @@ def _deliver(rep, html_text, text, folder, email_cfg, email_to):
     cfg = dict(email_cfg or {})
     if email_to:
         cfg["to"] = email_to
+    link = cfg.get("report_link") or notify.job_run_link()
+    title = cfg.get("subject")
+    email_html = notify.to_html(rep, email=True, link=link, title=title)
+    email_text = notify.to_text(rep, email=True, link=link, title=title)
     if cfg.get("to") and notify.should_send(cfg, rep):
         try:
-            notify.send_email(cfg, notify.subject(rep, cfg.get("subject_prefix", "[ETL parity]")), text, html_text)
+            notify.send_email(cfg, notify.subject(rep, cfg.get("subject_prefix", "[ETL parity]"), cfg.get("subject")),
+                              email_text, email_html)
             sent = True
             print(f"e-mail sent to {cfg['to']}")
         except Exception as e:                   # a mail problem must not hide the validation result
             err = f"{type(e).__name__}: {e}"
             print(f"e-mail NOT sent: {err}")
-    return path, sent, err
+    return path, sent, err, email_html
 
 
 @dataclass
@@ -580,11 +591,48 @@ class ParityReport:
     report_file: Optional[str] = None
     email_sent: bool = False
     email_error: Optional[str] = None
+    email_html: str = ""                # the short e-mail version
 
 
-def send_report(runs, config: Optional[str] = None, email_to: Optional[str] = None,
+def _latest_runs(spark, results_table: str, configs: list, since_hours: float) -> list:
+    """Latest run id per YAML (matched on the config path saved in the run_info row) within since_hours."""
+    import json as _json
+    from pyspark.sql import functions as F
+    from .results import RUN_ROW
+    cutoff = datetime.datetime.now() - datetime.timedelta(hours=since_hours)
+    rows = (spark.table(results_table).where((F.col("table_name") == RUN_ROW) & (F.col("run_ts") >= F.lit(cutoff)))
+            .select("run_id", "run_ts", "detail").orderBy(F.desc("run_ts")).collect())
+    found = []
+    for cfg in configs:
+        want = os.path.normpath(str(cfg))
+        hit = None
+        for r in rows:
+            try:
+                meta = _json.loads(r["detail"] or "{}")
+            except ValueError:
+                continue
+            if os.path.normpath(str(meta.get("config", ""))) == want:
+                hit = r["run_id"]
+                break
+        if not hit:                              # same file given by another path (relative / absolute): match the name
+            for r in rows:
+                try:
+                    meta = _json.loads(r["detail"] or "{}")
+                except ValueError:
+                    continue
+                if os.path.basename(str(meta.get("config", ""))) == os.path.basename(want):
+                    hit = r["run_id"]
+                    break
+        print(f"latest run of {os.path.basename(want)}: {hit or f'none in the last {since_hours:g}h (skipped)'}")
+        if hit:
+            found.append(hit)
+    return found
+
+
+def send_report(runs=None, config: Optional[str] = None, email_to: Optional[str] = None,
                 report_path: Optional[str] = None, send_on: Optional[str] = None,
-                spark: Optional[SparkSession] = None) -> ParityReport:
+                spark: Optional[SparkSession] = None, latest: Optional[list] = None,
+                since_hours: float = 24) -> ParityReport:
     """
     ONE report (and e-mail) for one or several finished runs, e.g. a full-load YAML and an incremental YAML:
 
@@ -594,6 +642,9 @@ def send_report(runs, config: Optional[str] = None, email_to: Optional[str] = No
 
     runs     ParityRun objects and / or run_id strings; None / "" entries are skipped (a run that did not happen),
              so the same call works when only one of the YAMLs was run.
+    latest   instead of run ids: YAML paths; for each, the latest run of that YAML in the last `since_hours`
+             hours is taken from the results table (a YAML without such a run is skipped):
+                 send_report(latest=[full_yaml, delta_yaml], config=full_yaml)
     config   YAML whose settings give results_table / mismatch_table / email / report_path (needed for run_id strings;
              with ParityRun objects only for the e-mail settings). email_to / report_path / send_on override them.
     The runs are read back from the results table, so this also works in a later job task than the runs themselves.
@@ -601,10 +652,14 @@ def send_report(runs, config: Optional[str] = None, email_to: Optional[str] = No
     from . import notify
     from .results import Recorder
     spark = spark or SparkSession.getActiveSession() or SparkSession.builder.appName("etl_parity").getOrCreate()
-    s = load_config(config).settings if config else None
+    s = load_config(config or (latest[0] if latest else None)).settings if (config or latest) else None
     items = [r for r in (runs if isinstance(runs, (list, tuple)) else [runs]) if r]
+    if latest:
+        if not s:
+            raise ValueError("send_report(latest=...): pass config=<yaml> with results_table")
+        items += _latest_runs(spark, s.results_table, latest, since_hours)
     if not items:
-        raise ValueError("send_report: no runs given (all entries empty)")
+        raise ValueError("send_report: no runs found (no run ids given, or no run of these YAMLs in the time window)")
     recs = []
     for r in items:
         run_id = r.run_id if isinstance(r, ParityRun) else str(r).strip()
@@ -614,13 +669,14 @@ def send_report(runs, config: Optional[str] = None, email_to: Optional[str] = No
             raise ValueError(f"send_report: results table unknown for run {run_id}: pass config=<yaml>")
         recs.append(Recorder.load(spark, rt, mt or "-", run_id))
     rep = notify.build_report(recs)
-    html_text, text = notify.to_html(rep), notify.to_text(rep)
     cfg = dict((s.email if s else None) or {})
+    html_text, text = notify.to_html(rep, title=cfg.get("subject")), notify.to_text(rep, title=cfg.get("subject"))
     if send_on:
         cfg["send_on"] = send_on
-    path, sent, err = _deliver(rep, html_text, text, report_path or (s.report_path if s else None), cfg, email_to)
-    return ParityReport(notify.subject(rep, cfg.get("subject_prefix", "[ETL parity]")), html_text, text,
-                        [r["run_id"] for r in rep["runs"]], rep["overall"], path, sent, err)
+    path, sent, err, email_html = _deliver(rep, html_text, text, report_path or (s.report_path if s else None),
+                                           cfg, email_to)
+    return ParityReport(notify.subject(rep, cfg.get("subject_prefix", "[ETL parity]"), cfg.get("subject")), html_text, text,
+                        [r["run_id"] for r in rep["runs"]], rep["overall"], path, sent, err, email_html)
 
 
 def main(argv=None):
