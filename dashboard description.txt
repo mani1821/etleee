@@ -1,0 +1,15 @@
+About this report
+
+Compares each table from the new ETL (target) with the existing ETL (source).
+PASS = no difference · WARN = within tolerance (counts as passed) · FAIL = beyond tolerance · ERROR = table could not be validated. A table passes when no validation fails.
+
+Schema: same columns and data types on both sides.
+Row count: same number of rows.
+Row hash: same rows with the same values.
+with keys: missing keys, extra keys, null or duplicate keys, and rows whose values differ (per column);
+without keys: rows only in source, rows only in target, and rows with a different number of copies.
+Tables over 500k rows are compared on a sample: the same 10% of keys on both sides.
+Column distributions: row counts per value, text length, day/month and hour for text, date and timestamp columns. This catches wrong codes, truncated text and shifted dates.
+Incremental: only the rows each ETL run wrote in the load window: delta row count, keys written by only one run, and matching values for keys written by both.
+
+Details: parity_results (every check) and parity_mismatches (example rows), filtered by run_id.
