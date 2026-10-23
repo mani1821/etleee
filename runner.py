@@ -327,10 +327,12 @@ class TableValidator:
         missed, extra = ks.join(kt, keys, "left_anti"), kt.join(ks, keys, "left_anti")
         n_missed, n_extra = missed.count(), extra.count()
         ktol = self._delta_tol(spec, "key_tolerance_pct")
-        kpct = (n_missed + n_extra) / max(ks.count(), 1) * 100
+        n_ks = ks.count()
+        kpct = (n_missed + n_extra) / max(n_ks, 1) * 100
         self.rec.rec(t, V, "delta_keys", self._within(n_missed + n_extra, kpct, ktol), n_missed, n_extra,
-                     f"src_value = touched by the source run only, tgt_value = touched by the target run only; "
-                     f"{kpct:.4f}% of the source delta keys (tolerance {ktol}%)")
+                     f"{n_missed:,} key(s) in the source delta but not in the target delta (src_value), "
+                     f"{n_extra:,} key(s) in the target delta but not in the source delta (tgt_value); "
+                     f"{n_missed + n_extra:,} of {n_ks:,} source delta keys = {kpct:.4f}% (tolerance {ktol}%)")
         if n_missed:
             self.rec.mismatches(t, V, "delta_missing_in_target", missed.select(key_json(keys).alias("key")))
         if n_extra:
@@ -349,8 +351,9 @@ class TableValidator:
             self._rows_compared(t, V, rows.scope, r.src_rows, r.tgt_rows, n_s, n_t, check="delta_rows_compared")
         finally:
             try_unpersist(src_df, tgt_df)
-        note = (f"delta {n_s:,} vs {n_t:,}; keys: {n_missed:,} missed, {n_extra:,} extra; "
-                f"values on {self._scope_text(rows.scope, r.src_rows, r.tgt_rows)}: ")
+        note = (f"delta {n_s:,} vs {n_t:,}; keys: {n_missed:,} only in source delta, {n_extra:,} only in target delta; "
+                f"values on the {r.matched:,} key(s) in both deltas"
+                + (" (sample)" if "sample" in rows.scope else "") + ": ")
         if r.dup_excluded:
             note += f"{r.dup_excluded:,} duplicated delta key(s) left out; "
         if r.differing:
