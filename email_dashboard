@@ -1,0 +1,27 @@
+from databricks.sdk import WorkspaceClient
+from databricks.sdk.service import jobs
+
+DASHBOARD_ID = "<dashboard id>"          # from the dashboard URL: .../dashboardsv3/<id>/published
+WAREHOUSE_ID = "<serverless or pro SQL warehouse id>"
+SUBSCRIBERS  = ["skk983@ftr.com"]        # workspace users (or use destination_id= for a notification destination)
+JOB_NAME     = "parity_dashboard_email"  # small helper job, created once and reused
+
+w = WorkspaceClient()                    # uses the notebook's own credentials
+task = jobs.Task(
+    task_key="email_dashboard",
+    dashboard_task=jobs.DashboardTask(
+        dashboard_id=DASHBOARD_ID,
+        warehouse_id=WAREHOUSE_ID,
+        subscription=jobs.Subscription(
+            subscribers=[jobs.SubscriptionSubscriber(user_name=u) for u in SUBSCRIBERS],
+            paused=False)))
+
+found = list(w.jobs.list(name=JOB_NAME))
+if found:
+    job_id = found[0].job_id
+    w.jobs.reset(job_id, new_settings=jobs.JobSettings(name=JOB_NAME, tasks=[task]))
+else:
+    job_id = w.jobs.create(name=JOB_NAME, tasks=[task]).job_id
+
+run = w.jobs.run_now(job_id).result()    # refreshes the dashboard and e-mails the PDF snapshot; waits for it
+print("dashboard e-mail:", run.state.result_state, run.run_page_url)
