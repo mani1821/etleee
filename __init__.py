@@ -9,5 +9,5 @@ from .delta_yaml import build_delta_yaml
 from .keys import KeySettings, discover_keys, to_yaml
 from .runner import ParityReport, ParityRun, main, run_parity, send_report
 
-__version__ = "3.11.2"
+__version__ = "3.11.3"
 __all__ = ["run_parity", "send_report", "build_delta_yaml", "ParityReport", "main", "ParityRun", "discover_keys", "to_yaml", "KeySettings", "__version__"]
